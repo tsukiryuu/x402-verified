@@ -6,6 +6,7 @@
 //  - reports facts only; scoring lives in scripts/lib/rubrics/*.js
 const { promises: dns } = require("node:dns");
 const net = require("node:net");
+const https = require("node:https");
 
 const TIMEOUT_MS = 8000;
 const MAX_BYTES = 64 * 1024;
@@ -19,7 +20,7 @@ function isPrivateIp(ip) {
   if (net.isIPv6(low) || low.includes(":")) {
     return (
       low === "::1" || low === "::" || low.startsWith("fe80") || low.startsWith("fc") ||
-      low.startsWith("fd") || low.startsWith("::ffff:127.") || low.startsWith("::ffff:10.") ||
+      low.startsWith("fd") || low.startsWith("::ffff:") || low.startsWith("ff") || low.startsWith("2001:db8:") || low.startsWith("::ffff:127.") || low.startsWith("::ffff:10.") ||
       low.startsWith("::ffff:192.168.") || low.startsWith("::ffff:169.254.") ||
       /^::ffff:172\.(1[6-9]|2\d|3[01])\./.test(low)
     );
@@ -27,28 +28,40 @@ function isPrivateIp(ip) {
   return (
     /^127\./.test(ip) || /^10\./.test(ip) || /^192\.168\./.test(ip) ||
     /^172\.(1[6-9]|2\d|3[01])\./.test(ip) || /^169\.254\./.test(ip) ||
+    /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(ip) ||
+    /^198\.(1[89])\./.test(ip) || /^(22[4-9]|23\d|24\d|25[0-5])\./.test(ip) ||
     ip === "0.0.0.0" || /^0\./.test(ip)
   );
 }
 
-async function validateTarget(rawUrl) {
-  let u;
-  try { u = new URL(rawUrl); } catch { throw new ProbeInputError(`not a valid URL: ${rawUrl}`); }
-  if (u.protocol !== "https:") throw new ProbeInputError("only https URLs are probed");
-  const hostname = u.hostname.toLowerCase();
+async function resolveSafeTarget(rawUrl) {
+  // Resolve once and pin the resulting public IP to the actual HTTPS
+  // connection. A second DNS lookup at connection time would re-open DNS
+  // rebinding even after successful URL validation.
+  let url;
+  try { url = new URL(rawUrl); }
+  catch { throw new ProbeInputError("not a valid URL"); }
+  if (url.protocol !== "https:") throw new ProbeInputError("only https URLs are probed");
+  if (url.username || url.password) throw new ProbeInputError("credential-bearing URLs are refused");
+  const hostname = url.hostname.toLowerCase();
   if (hostname === "localhost" || hostname.endsWith(".internal") || hostname.endsWith(".local")) {
-    throw new ProbeInputError("local and internal hostnames are refused");
+    throw new ProbeInputError("local or internal hostname refused");
   }
-  const port = u.port || "443";
-  if (!ALLOWED_PORTS.has(port)) throw new ProbeInputError(`port ${port} is not probed`);
-  if (net.isIP(hostname)) {
-    if (isPrivateIp(hostname)) throw new ProbeInputError("private IP refused");
-  } else {
-    const address = await dns.lookup(hostname).then((r) => r.address).catch(() => null);
-    if (!address) throw new ProbeInputError(`DNS resolution failed for ${hostname}`);
-    if (isPrivateIp(address)) throw new ProbeInputError("hostname resolves to a private address");
+  const port = url.port || "443";
+  if (!ALLOWED_PORTS.has(port)) throw new ProbeInputError("port not permitted");
+  const literalFamily = net.isIP(hostname);
+  const addresses = literalFamily
+    ? [{ address: hostname, family: literalFamily }]
+    : await dns.lookup(hostname, { all: true }).catch(() => []);
+  if (!addresses.length) throw new ProbeInputError("DNS resolution unavailable");
+  if (addresses.some((item) => !net.isIP(item.address) || isPrivateIp(item.address))) {
+    throw new ProbeInputError("private or reserved network destination refused");
   }
-  return u;
+  return { url, address: addresses[0].address, family: addresses[0].family };
+}
+
+async function validateTarget(rawUrl) {
+  return (await resolveSafeTarget(rawUrl)).url;
 }
 
 async function readCapped(res, cap) {
@@ -73,21 +86,63 @@ async function readCapped(res, cap) {
   return Buffer.concat(chunks);
 }
 
-async function doFetch(url, method, body) {
-  const res = await fetch(url, {
-    method,
-    redirect: "manual",
-    signal: AbortSignal.timeout(TIMEOUT_MS),
-    cache: "no-store",
-    headers: {
-      "user-agent": USER_AGENT,
-      accept: "application/json, */*",
-      ...(method === "POST" ? { "content-type": "application/json" } : {}),
-    },
-    body: method === "POST" ? JSON.stringify(body ?? {}) : undefined,
+async function requestChecked(rawUrl, method = "GET", body = undefined, timeout = TIMEOUT_MS) {
+  const checked = await resolveSafeTarget(rawUrl);
+  const encoded = method === "POST" ? JSON.stringify(body ?? {}) : null;
+  return new Promise((resolve, reject) => {
+    const req = https.request(checked.url, {
+      method,
+      timeout,
+      headers: {
+        "user-agent": USER_AGENT,
+        accept: "application/json, */*",
+        ...(encoded != null ? { "content-type": "application/json" } : {}),
+      },
+      lookup: (_name, options, callback) => {
+        // The HTTPS connection is pinned to the address already vetted.
+        // URL hostname, Host header, SNI and certificate checks stay intact.
+        if (options && options.all) callback(null, [{ address: checked.address, family: checked.family }]);
+        else callback(null, checked.address, checked.family);
+      },
+    }, (res) => {
+      const chunks = [];
+      let total = 0;
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        resolve({
+          status: res.statusCode ?? 0,
+          headers: {
+            get(name) {
+              const value = res.headers[String(name).toLowerCase()];
+              return Array.isArray(value) ? value.join(", ") : value ?? null;
+            },
+          },
+          body: Buffer.concat(chunks),
+        });
+      };
+      res.on("data", (data) => {
+        const remaining = MAX_BYTES - total;
+        if (remaining > 0) chunks.push(data.subarray(0, remaining));
+        total += data.length;
+        if (total > MAX_BYTES) {
+          finish();
+          res.destroy();
+        }
+      });
+      res.on("end", finish);
+      res.on("error", reject);
+    });
+    req.on("timeout", () => req.destroy(new Error("probe timed out")));
+    req.on("error", reject);
+    if (encoded != null) req.write(encoded);
+    req.end();
   });
-  const buf = await readCapped(res, MAX_BYTES);
-  return { status: res.status, headers: res.headers, body: buf };
+}
+
+async function doFetch(url, method, body) {
+  return requestChecked(url, method, body, TIMEOUT_MS);
 }
 
 function decodeBase64Json(b64) {
@@ -195,10 +250,9 @@ async function probeEndpoint(endpoint) {
 
 async function fetchText(url, ms = 4000) {
   try {
-    const res = await fetch(url, { redirect: "manual", signal: AbortSignal.timeout(ms), cache: "no-store", headers: { "user-agent": USER_AGENT } });
-    if (!res.ok) return null;
-    const buf = await readCapped(res, MAX_BYTES);
-    return buf.toString("utf8");
+    const res = await requestChecked(url, "GET", undefined, ms);
+    if (res.status < 200 || res.status >= 300) return null;
+    return res.body.toString("utf8");
   } catch { return null; }
 }
 
